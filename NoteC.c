@@ -1,11 +1,18 @@
 /*** includes ***/
 
+//Feature Test Macros:
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#define _GNU_SOURCE //to enable "getline()" on GNU systems .... (https://stackoverflow.com/questions/59014090/warning-implicit-declaration-of-function-getline)
+//-------------------
+
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -29,14 +36,25 @@ enum editorKey {
 
 /*** data ***/
 
-struct editorConfig {
-    int cx, cy;//for cursor position
+typedef struct erow
+{
+    int size;
+    char *chars;
+} erow;
+
+struct editorConfig 
+{
+    int cx, cy; // for cursor position
+    int rowoff; // row offset...for vertical scrolling
     int screenrows;
     int screencols;
+    int numrows;
+    erow *row; // to store multiple line
     struct termios orig_termios;
 };
 
 struct editorConfig E;
+
 /*** terminal ***/
 
 void die(const char* s) {
@@ -58,10 +76,10 @@ void enableRawMode()
     if(tcgetattr(STDIN_FILENO, &E.orig_termios) == -1){
         die("tcgetattr");
     }
-
-    tcgetattr(STDIN_FILENO, &E.orig_termios);
-
     atexit(disableRawMode);
+
+    // tcgetattr(STDIN_FILENO, &E.orig_termios);
+
 
     struct termios raw = E.orig_termios;
 
@@ -153,7 +171,7 @@ int getWindowSize(int *rows, int * cols) {
     struct winsize ws;
 
     if(ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
-        if(write(STDOUT_FILENO, "\x1b[999C\x1b[999B", 12) != 12)return -1;
+        if(write(STDOUT_FILENO, "\x1b[999C\x1b[999B", 12) != 12) return -1;
         return getCursorPosition(rows, cols);
     } else {
         *cols = ws.ws_col;
@@ -161,6 +179,44 @@ int getWindowSize(int *rows, int * cols) {
         return 0;
     }
 }
+
+/*** row operations ***/
+
+void editorAppendRow(char *s, size_t len){
+    E.row = realloc(E.row, sizeof(erow)*(E.numrows + 1));
+
+    int at = E.numrows;
+    E.row[at].size = len;
+    E.row[at].chars = malloc(len + 1);
+    memcpy(E.row[at].chars, s, len);
+    E.row[at].chars[len] = '\0';
+    E.numrows++;
+}
+
+/*** file i/o ***/
+
+void editorOpen(char *filename) // editorOpen() will eventually be for opening and reading a file from disk, so we put it in a new /*** file i/o ***/ section.
+{          
+    FILE *fp = fopen(filename, "r");
+    if(!fp) die("fopen");
+
+    char *line = NULL;
+    size_t linecap = 0;
+    ssize_t linelen; //ssize_t can represent -1 signal unlike size_t
+    linelen = getline(&line, &linecap, fp);
+
+    if(linelen != -1) {
+        while( (linelen = getline(&line, &linecap, fp)) != -1 ) { // keep reading line from the file till EOF is encountered(hence returning -1 through getline())
+            while(linelen > 0 && (line[linelen-1] == '\n' || line[linelen-1] == '\r')) //reducing linelen till escape charaters are out of its range
+                linelen--;
+
+            editorAppendRow(line, linelen);
+        }
+    }  
+
+    free(line);
+    fclose(fp);  
+}   
 
 /*** append buffer ***/
 
@@ -186,27 +242,53 @@ void abFree(struct abuf *ab) {
 
 /*** output ***/
 
+void editorScroll() {
+    /* 
+    checks if the cursor is above the visible window, and if so, 
+    scrolls up to where the cursor is.
+    */
+    if(E.cy < E.rowoff){
+        E.rowoff = E.cy;
+    }
+    /*
+    checks if the cursor is past the bottom of the visible window,
+    */
+    if(E.cy >= E.rowoff + E.screenrows){    //E.rowoff refers to what’s at the top of the screen, and we have to get E.screenrows involved to talk about what’s at the bottom of the screen.
+        E.rowoff = E.cy - E.screenrows + 1;
+    }
+}
+
 void editorDrawRows(struct abuf *ab) {
     int y;
     for(y=0; y < E.screenrows; y++) {
-
-        if(y==E.screenrows/3){
-            char welcome[80];
-            int welcomelen = snprintf(welcome,sizeof(welcome),"NoteC editor version -- version %s", NOTEC_VERSION);
-            if(welcomelen > E.screencols) welcomelen = E.screencols;
-            //centering the welcome message
-            
-            int padding = (E.screencols - welcomelen)/2;
-            if(padding){
-                abAppend(ab,"~",1);
-                padding--;
+        int filerow = y + E.rowoff;
+        if(filerow >= E.numrows){ 
+            if(E.numrows == 0 && y == E.screenrows / 3){ 
+                    char welcome[80];
+                    int welcomelen = snprintf(welcome,sizeof(welcome),"NoteC editor version -- version %s", NOTEC_VERSION);
+                    if(welcomelen > E.screencols) welcomelen = E.screencols;
+                    
+                    //centering the welcome message
+                    int padding = (E.screencols - welcomelen)/2;
+                    if(padding){
+                        abAppend(ab, "~", 1);
+                        padding--;
+                    }
+                    while(padding--) abAppend(ab," ", 1);
+                    //
+                    abAppend(ab, welcome, welcomelen); 
+            } else {
+                abAppend(ab, "~", 1);
             }
-            while(padding--) abAppend(ab," ", 1);
+        } else {
+            int len = E.row[filerow].size;// getting size of each line in E.row[] buffer
+            
+            if(len > E.screencols) 
+            {
+                len = E.screencols;
+            }
 
-            //
-            abAppend(ab,welcome,welcomelen);
-        }else{
-            abAppend(ab,"~",1);
+            abAppend(ab, E.row[filerow].chars, len);//extract each line from "E.row[]" buffer and pushing it in output buffer "ab"
         }
 
         abAppend(ab, "\x1b[k", 3);//---> refreshing one line at a time
@@ -217,6 +299,8 @@ void editorDrawRows(struct abuf *ab) {
 }
 
 void editorRefreshScreen() {
+    editorScroll();
+
     struct abuf ab = ABUF_INIT;
 
     abAppend(&ab, "\x1b[?25l", 6);//set mode-->hide the cursor
@@ -294,17 +378,23 @@ void editorProcessKeypress() {
 
 /*** init ***/
 
-void intiEditor() {
+void initEditor() {
     //initialise cursors position
     E.cx = 0;
     E.cy = 0;
+    E.rowoff = 0; // Initializing it to 0, which means we’ll be scrolled to the top of the file by default.
+    E.numrows = 0;
+    E.row = NULL;
 
     if(getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
 }
 
-int main() {
+int main(int argc, char *argv[]) {
     enableRawMode();
-    intiEditor();
+    initEditor();
+    if(argc >= 2){ // i.e. execute only if filename is also passed in terminal command
+        editorOpen(argv[1]);
+    }
 
     while (1) {
         editorRefreshScreen();
