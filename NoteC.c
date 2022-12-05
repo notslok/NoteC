@@ -46,6 +46,7 @@ struct editorConfig
 {
     int cx, cy; // for cursor position
     int rowoff; // row offset...for vertical scrolling
+    int coloff;
     int screenrows;
     int screencols;
     int numrows;
@@ -254,7 +255,15 @@ void editorScroll() {
     checks if the cursor is past the bottom of the visible window,
     */
     if(E.cy >= E.rowoff + E.screenrows){    //E.rowoff refers to what’s at the top of the screen, and we have to get E.screenrows involved to talk about what’s at the bottom of the screen.
-        E.rowoff = E.cy - E.screenrows + 1;
+        E.rowoff = E.cy - E.screenrows + 1; 
+    }
+
+    /* horizontal scrolling logic */
+    if(E.cx < E.coloff){
+        E.coloff = E.cx;
+    }
+    if(E.cx >= E.coloff + E.screencols) {
+        E.coloff = E.cx - E.screencols + 1;
     }
 }
 
@@ -281,14 +290,19 @@ void editorDrawRows(struct abuf *ab) {
                 abAppend(ab, "~", 1);
             }
         } else {
-            int len = E.row[filerow].size;// getting size of each line in E.row[] buffer
+            int len = E.row[filerow].size - E.coloff;// getting size of each line in E.row[] buffer
+            
+            if(len < 0) 
+            {
+                len = 0;
+            }
             
             if(len > E.screencols) 
             {
                 len = E.screencols;
             }
 
-            abAppend(ab, E.row[filerow].chars, len);//extract each line from "E.row[]" buffer and pushing it in output buffer "ab"
+            abAppend(ab, &E.row[filerow].chars[E.coloff], len);//extract each line from "E.row[]" buffer and pushing it in output buffer "ab"
         }
 
         abAppend(ab, "\x1b[k", 3);//---> refreshing one line at a time
@@ -310,7 +324,7 @@ void editorRefreshScreen() {
     editorDrawRows(&ab);
 
     char buf[32];
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy+1, E.cx+1);//We add 1 to E.cy and E.cx to convert from 0-indexed values to the 1-indexed values that the terminal uses.
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1, (E.cx - E.coloff) + 1);//We add 1 to E.cy and E.cx to convert from 0-indexed values to the 1-indexed values that the terminal uses.
     abAppend(&ab, buf, strlen(buf));
 
     abAppend(&ab, "\x1b[?25h", 6);//reset mode-->to turn on the cursor again
@@ -322,15 +336,23 @@ void editorRefreshScreen() {
 /*** input ***/
 
 void editorMoveCursor(int key){
+    erow *row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
+
     switch(key) {
         case ARROW_LEFT:    if(E.cx != 0){
                                 E.cx--;
+                            } else if (E.cy > 0) { // allowing the user to press ← at the beginning of the line to move to the end of the previous line.
+                                E.cy--; // set cursor to prev. line
+                                E.cx = E.row[E.cy].size; // move cursor to prev. line's ending
                             }
                             break;
         
-        case ARROW_RIGHT:   if(E.cx != E.screencols-1){
+        case ARROW_RIGHT:   if(row && E.cx < row->size){
                                 E.cx++;
-                            }
+                            } else if (row && E.cx == row->size){ // ...if cursor is at a valid row AND cursor is pointing at a valid column
+                                E.cy++; // move cursor to next line
+                                E.cx = 0; // set the cursor to the starting of the next line
+                            } // <--------------- ckpt. step 79
                             break;
         
         case ARROW_UP:      if(E.cy != 0){
@@ -342,6 +364,13 @@ void editorMoveCursor(int key){
                                 E.cy++;
                             }
                             break;
+    }
+    
+    row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
+    int rowlen = row ? row->size : 0;
+    if(E.cx > rowlen){
+        E.cx = rowlen; //by moving the cursor to the end of a long line, then moving it down to the next line, which is shorter. The E.cx value won’t change, and the cursor will be off to the right of the end of the line it’s now on.
+    //!!! improvement : vs code like vertical scrolling !!!
     }
 }
 
@@ -383,6 +412,7 @@ void initEditor() {
     E.cx = 0;
     E.cy = 0;
     E.rowoff = 0; // Initializing it to 0, which means we’ll be scrolled to the top of the file by default.
+    E.coloff = 0;
     E.numrows = 0;
     E.row = NULL;
 
